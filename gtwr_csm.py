@@ -21,13 +21,20 @@ integrated into the predicted market value of the target property.
 How to integrate: a novel weight function using GTWR
 
 '''
-
-
+import time
 import pandas as pd
+import requests
+import numpy as np
+from tqdm import tqdm
+from pyproj import Transformer
+from geopy.distance import geodesic
+from sklearn.neighbors import KDTree
+import multiprocessing as mp
 
 '''
 Data Processing
 '''
+
 
 def data_processing(data):
     # Delete unwanted column
@@ -60,11 +67,60 @@ def data_processing(data):
 
 
 # Feature construction
-def spatial_information(data, index):
-    address = data.loc[index, 'Estate'] + ' ' + data.loc[index, 'Block']
-    print(address)
+def spatial_information(data):
+    data.replace(np.nan, '', inplace=True)
+
+    for i in tqdm(range(len(data))):
+        if data.loc[i, 'Block'] is None:
+            address = data.loc[i, 'Estate']
+        else:
+            address = data.loc[i, 'Estate'] + ' ' + data.loc[i, 'Block']
+
+        # Build the URL for retrieving Easting and Northing
+        location_url = "https://geodata.gov.hk/gs/api/v1.0.0/locationSearch?q={}".format(address)
+        response = requests.get(location_url)
+        response = response.json()
+
+        # Retrieve the x and y information
+        x = response[0]['x']
+        y = response[0]['y']
+
+        # Add x and y to the dataset
+        data.loc[i, 'x'] = x
+        data.loc[i, 'y'] = y
+
+        # Server rest
+        time.sleep(1)
+
+    data.to_csv('data_xy.csv', index=None)
+
+
+def distance_facility(data, facility):
+    # HKGrid1980 to WGS84
+    tf = Transformer.from_crs('epsg:2326', 'epsg:4326', always_xy=True)
+
+    # property data
+    data['Longitude'] = data.apply(lambda x: tf.transform(x['x'], x['y'])[0], axis=1)
+    data['Latitude'] = data.apply(lambda x: tf.transform(x['x'], x['y'])[1], axis=1)
+
+    # facility data
+    facility['Longitude'] = facility.apply(lambda x: tf.transform(x['EASTING'], x['NORTHING'])[0], axis=1)
+    facility['Latitude'] = facility.apply(lambda x: tf.transform(x['EASTING'], x['NORTHING'])[1], axis=1)
+
+    temp = []
+    for i in range(len(data)):
+        facility['distance'] = facility.apply(lambda x: geodesic((data.loc[i, 'Latitude'], data.loc[i, 'Longitude']),
+                                                                 (x['Latitude'], x['Longitude'])).m, axis=1)
+        facilities_1km = facility[facility['distance'] <= 1000][['GEONAMEID', 'distance']].reset_index(drop=True)
+        facilities_1km.insert(loc=0, column='ID', value=data.loc[i, 'ID'])
+        temp.append(facilities_1km)
 
 
 if __name__ == "__main__":
-    data = pd.read_csv('final.csv')
-    data_processing(data)
+    # data = pd.read_csv('final.csv')
+    # data_processing(data)
+    new_data = pd.read_csv('data.csv')
+    test_data = pd.read_csv('data_xy.csv')
+    facility_data = pd.read_csv('GeoCom4.0_202203.csv', low_memory=False)
+    distance_facility(test_data, facility_data)
+
