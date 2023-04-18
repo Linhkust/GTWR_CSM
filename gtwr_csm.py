@@ -28,8 +28,8 @@ import numpy as np
 from tqdm import tqdm
 from pyproj import Transformer
 from geopy.distance import geodesic
-from sklearn.neighbors import KDTree
-import multiprocessing as mp
+from scipy.stats import entropy
+import concurrent.futures
 
 '''
 Data Processing
@@ -95,7 +95,7 @@ def spatial_information(data):
     data.to_csv('data_xy.csv', index=None)
 
 
-def distance_facility(data, facility):
+def distance_facility(data, facility, wifi, threshold):
     # HKGrid1980 to WGS84
     tf = Transformer.from_crs('epsg:2326', 'epsg:4326', always_xy=True)
 
@@ -107,20 +107,75 @@ def distance_facility(data, facility):
     facility['Longitude'] = facility.apply(lambda x: tf.transform(x['EASTING'], x['NORTHING'])[0], axis=1)
     facility['Latitude'] = facility.apply(lambda x: tf.transform(x['EASTING'], x['NORTHING'])[1], axis=1)
 
-    temp = []
+    # wifi_data
+    wifi['Longitude'] = wifi.apply(lambda x: tf.transform(x['Easting'], x['Northing'])[0], axis=1)
+    wifi['Latitude'] = wifi.apply(lambda x: tf.transform(x['Easting'], x['Northing'])[1], axis=1)
+
+    # 每个property都要计算一遍
+    results = []
     for i in range(len(data)):
-        facility['distance'] = facility.apply(lambda x: geodesic((data.loc[i, 'Latitude'], data.loc[i, 'Longitude']),
-                                                                 (x['Latitude'], x['Longitude'])).m, axis=1)
-        facilities_1km = facility[facility['distance'] <= 1000][['GEONAMEID', 'distance']].reset_index(drop=True)
-        facilities_1km.insert(loc=0, column='ID', value=data.loc[i, 'ID'])
-        temp.append(facilities_1km)
+
+        facility['distance'] = facility.apply(lambda x: geodesic((data.loc[i, 'Latitude'],
+                                                                  data.loc[i, 'Longitude']),
+                                                                  (x['Latitude'], x['Longitude'])).m, axis=1)
+
+        wifi['distance'] = wifi.apply(lambda x: geodesic((data.loc[i, 'Latitude'],
+                                                                  data.loc[i, 'Longitude']),
+                                                                  (x['Latitude'], x['Longitude'])).m, axis=1)
+
+        facilities_1km = facility[facility['distance'] <= 1000][['GEONAMEID', 'CLASS', 'TYPE', 'distance']].reset_index(drop=True)
+        wifi_1km = wifi[wifi['distance'] <= 1000].reset_index(drop=True)
+        # facilities_1km.insert(loc=0, column='ID', value=data.loc[i, 'ID'])
+
+        variables = {}
+
+        # POI density
+        poi_density = len(facilities_1km)
+        wifi_density = len(wifi_1km)
+
+        variables['wifi_hk'] = wifi_density
+        variables['POI_density'] = poi_density
+
+        # POI diversity
+        # Number of CLASS and TYPE
+        num_class = len(facilities_1km['CLASS'].unique())
+        num_type = len(facilities_1km['TYPE'].unique())
+        variables['Num_class'] = num_class
+        variables['Num_type'] = num_type
+
+        # Entropy-based CLASS diversity
+        class_unique_num = facilities_1km['CLASS'].value_counts()
+        class_unique_percentage = class_unique_num / class_unique_num.sum()
+        class_unique_percentage = class_unique_percentage.tolist()
+        class_entropy = entropy(class_unique_percentage, base=2)  # CLASS_Entropy
+        variables['Class_diversity'] = class_entropy
+
+        # Entropy-based TYPE diversity
+        type_unique_num = facilities_1km['TYPE'].value_counts()
+        type_unique_percentage = type_unique_num / type_unique_num.sum()
+        type_unique_percentage = type_unique_percentage.tolist()
+        type_entropy = entropy(type_unique_percentage, base=2)  # TYPE_Entropy
+        variables['Type_diversity'] = type_entropy
+
+        # Distance to the nearest unique TYPE of facility
+        facility_type = facilities_1km['TYPE'].unique()
+        for j in range(len(facility_type)):
+            distance = facilities_1km[facilities_1km['TYPE'] == facility_type[j]]['distance'].min()
+            variables[facility_type[j]] = distance
+            variables[facility_type[j] + '_walk'] = 1 if distance < threshold else 0
+
+        results.append(variables)
+    df = pd.concat([pd.DataFrame(l, index=[0]) for l in results], ignore_index=True)
+    df.to_csv('spatial_variables.csv', index=False)
 
 
 if __name__ == "__main__":
     # data = pd.read_csv('final.csv')
     # data_processing(data)
-    new_data = pd.read_csv('data.csv')
+    # new_data = pd.read_csv('data.csv')
     test_data = pd.read_csv('data_xy.csv')
     facility_data = pd.read_csv('GeoCom4.0_202203.csv', low_memory=False)
-    distance_facility(test_data, facility_data)
+    wifi_data = pd.read_csv('WIFI_HK.csv', low_memory=False)
+    walk_catchment = 400  # a distance range of 400m is defined as easily accessible
+    distance_facility(test_data, facility_data, wifi_data, walk_catchment)
 
