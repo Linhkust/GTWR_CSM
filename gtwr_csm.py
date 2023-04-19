@@ -30,6 +30,10 @@ from pyproj import Transformer
 from geopy.distance import geodesic
 from scipy.stats import entropy
 import concurrent.futures
+from functools import partial
+import warnings
+
+warnings.filterwarnings('ignore')
 
 '''
 Data Processing
@@ -113,26 +117,42 @@ def distance_facility(data, facility, wifi, threshold):
 
     # 每个property都要计算一遍
     results = []
-    for i in range(len(data)):
+    for i in tqdm(range(len(data))):
 
-        facility['distance'] = facility.apply(lambda x: geodesic((data.loc[i, 'Latitude'],
-                                                                  data.loc[i, 'Longitude']),
-                                                                  (x['Latitude'], x['Longitude'])).m, axis=1)
+        # Initial rectangular selection
+        facility_selection = facility[(facility['EASTING'] <= data.loc[i, 'x'] + 1000)
+                            & (facility['EASTING'] >= data.loc[i, 'x'] - 1000)
+                            & (facility['NORTHING'] >= data.loc[i, 'y'] - 1000)
+                            & (facility['NORTHING'] <= data.loc[i, 'y'] + 1000)].reset_index(drop=True)
 
-        wifi['distance'] = wifi.apply(lambda x: geodesic((data.loc[i, 'Latitude'],
-                                                                  data.loc[i, 'Longitude']),
-                                                                  (x['Latitude'], x['Longitude'])).m, axis=1)
+        facility_selection['distance'] = facility_selection.apply(lambda x: geodesic((data.loc[i, 'Latitude'],
+                                                                                      data.loc[i, 'Longitude']),
+                                                                                     (x['Latitude'],
+                                                                                      x['Longitude'])).m,
+                                                                                      axis=1)
+        try:
+            wifi_selection = wifi[(wifi['Easting'] <= data.loc[i, 'x'] + 1000)
+                                  & (wifi['Easting'] >= data.loc[i, 'x'] - 1000)
+                                  & (wifi['Northing'] >= data.loc[i, 'y'] - 1000)
+                                  & (wifi['Northing'] <= data.loc[i, 'y'] + 1000)].reset_index(drop=True)
 
-        facilities_1km = facility[facility['distance'] <= 1000][['GEONAMEID', 'CLASS', 'TYPE', 'distance']].reset_index(drop=True)
-        wifi_1km = wifi[wifi['distance'] <= 1000].reset_index(drop=True)
-        # facilities_1km.insert(loc=0, column='ID', value=data.loc[i, 'ID'])
+            wifi_selection['distance'] = wifi_selection.apply(lambda x: geodesic((data.loc[i, 'Latitude'],
+                                                                              data.loc[i, 'Longitude']),
+                                                                             (x['Latitude'],
+                                                                              x['Longitude'])).m,
+                                                                              axis=1)
+            wifi_1km = wifi_selection[wifi_selection['distance'] <= 1000].reset_index(drop=True)
+            wifi_density = len(wifi_1km)
+
+        except (KeyError, ValueError):
+            wifi_density = 0
+
+        facilities_1km = facility_selection[facility_selection['distance'] <= 1000][['GEONAMEID', 'CLASS', 'TYPE', 'distance']].reset_index(drop=True)
 
         variables = {}
 
         # POI density
         poi_density = len(facilities_1km)
-        wifi_density = len(wifi_1km)
-
         variables['wifi_hk'] = wifi_density
         variables['POI_density'] = poi_density
 
@@ -165,17 +185,24 @@ def distance_facility(data, facility, wifi, threshold):
             variables[facility_type[j] + '_walk'] = 1 if distance < threshold else 0
 
         results.append(variables)
-    df = pd.concat([pd.DataFrame(l, index=[0]) for l in results], ignore_index=True)
-    df.to_csv('spatial_variables.csv', index=False)
+
+    df = pd.concat([pd.DataFrame(l, index=[0]) for l in results], axis=0, ignore_index=True)
+    df = pd.concat([data, df], axis=1)
+
+    df.to_csv('data_variables.csv', index=False)
 
 
 if __name__ == "__main__":
-    # data = pd.read_csv('final.csv')
-    # data_processing(data)
-    # new_data = pd.read_csv('data.csv')
-    test_data = pd.read_csv('data_xy.csv')
+    # data import
+    property_data = pd.read_csv('data_xy.csv', encoding='unicode_escape')
     facility_data = pd.read_csv('GeoCom4.0_202203.csv', low_memory=False)
     wifi_data = pd.read_csv('WIFI_HK.csv', low_memory=False)
-    walk_catchment = 400  # a distance range of 400m is defined as easily accessible
-    distance_facility(test_data, facility_data, wifi_data, walk_catchment)
+    walk_threshold = 400
+
+    # Construct the variables
+    distance_facility(property_data, facility_data, wifi_data, walk_threshold)
+
+
+
+
 
