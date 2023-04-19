@@ -99,7 +99,7 @@ def spatial_information(data):
     data.to_csv('data_xy.csv', index=None)
 
 
-def distance_facility(data, facility, wifi, threshold):
+def facility_variables(row, data, facility, wifi, threshold):
     # HKGrid1980 to WGS84
     tf = Transformer.from_crs('epsg:2326', 'epsg:4326', always_xy=True)
 
@@ -117,79 +117,102 @@ def distance_facility(data, facility, wifi, threshold):
 
     # 每个property都要计算一遍
     results = []
-    for i in tqdm(range(len(data))):
 
-        # Initial rectangular selection
-        facility_selection = facility[(facility['EASTING'] <= data.loc[i, 'x'] + 1000)
-                            & (facility['EASTING'] >= data.loc[i, 'x'] - 1000)
-                            & (facility['NORTHING'] >= data.loc[i, 'y'] - 1000)
-                            & (facility['NORTHING'] <= data.loc[i, 'y'] + 1000)].reset_index(drop=True)
+    # Initial rectangular selection
+    facility_selection = facility[(facility['EASTING'] <= data.loc[row, 'x'] + 1000)
+                        & (facility['EASTING'] >= data.loc[row, 'x'] - 1000)
+                        & (facility['NORTHING'] >= data.loc[row, 'y'] - 1000)
+                        & (facility['NORTHING'] <= data.loc[row, 'y'] + 1000)].reset_index(drop=True)
 
-        facility_selection['distance'] = facility_selection.apply(lambda x: geodesic((data.loc[i, 'Latitude'],
-                                                                                      data.loc[i, 'Longitude']),
-                                                                                     (x['Latitude'],
-                                                                                      x['Longitude'])).m,
-                                                                                      axis=1)
-        try:
-            wifi_selection = wifi[(wifi['Easting'] <= data.loc[i, 'x'] + 1000)
-                                  & (wifi['Easting'] >= data.loc[i, 'x'] - 1000)
-                                  & (wifi['Northing'] >= data.loc[i, 'y'] - 1000)
-                                  & (wifi['Northing'] <= data.loc[i, 'y'] + 1000)].reset_index(drop=True)
+    facility_selection['distance'] = facility_selection.apply(lambda x: geodesic((data.loc[row, 'Latitude'],
+                                                                                  data.loc[row, 'Longitude']),
+                                                                                 (x['Latitude'],
+                                                                                  x['Longitude'])).m,
+                                                                                  axis=1)
+    try:
+        wifi_selection = wifi[(wifi['Easting'] <= data.loc[row, 'x'] + 1000)
+                              & (wifi['Easting'] >= data.loc[row, 'x'] - 1000)
+                              & (wifi['Northing'] >= data.loc[row, 'y'] - 1000)
+                              & (wifi['Northing'] <= data.loc[row, 'y'] + 1000)].reset_index(drop=True)
 
-            wifi_selection['distance'] = wifi_selection.apply(lambda x: geodesic((data.loc[i, 'Latitude'],
-                                                                              data.loc[i, 'Longitude']),
-                                                                             (x['Latitude'],
-                                                                              x['Longitude'])).m,
-                                                                              axis=1)
-            wifi_1km = wifi_selection[wifi_selection['distance'] <= 1000].reset_index(drop=True)
-            wifi_density = len(wifi_1km)
+        wifi_selection['distance'] = wifi_selection.apply(lambda x: geodesic((data.loc[row, 'Latitude'],
+                                                                          data.loc[row, 'Longitude']),
+                                                                         (x['Latitude'],
+                                                                          x['Longitude'])).m,
+                                                                          axis=1)
+        wifi_1km = wifi_selection[wifi_selection['distance'] <= 1000].reset_index(drop=True)
+        wifi_density = len(wifi_1km)
 
-        except (KeyError, ValueError):
-            wifi_density = 0
+    except (KeyError, ValueError):
+        wifi_density = 0
 
-        facilities_1km = facility_selection[facility_selection['distance'] <= 1000][['GEONAMEID', 'CLASS', 'TYPE', 'distance']].reset_index(drop=True)
+    facilities_1km = facility_selection[facility_selection['distance'] <= 1000][['GEONAMEID', 'CLASS', 'TYPE', 'distance']].reset_index(drop=True)
 
-        variables = {}
+    variables = {}
 
-        # POI density
-        poi_density = len(facilities_1km)
-        variables['wifi_hk'] = wifi_density
-        variables['POI_density'] = poi_density
+    # POI density
+    poi_density = len(facilities_1km)
+    variables['wifi_hk'] = wifi_density
+    variables['POI_density'] = poi_density
 
-        # POI diversity
-        # Number of CLASS and TYPE
-        num_class = len(facilities_1km['CLASS'].unique())
-        num_type = len(facilities_1km['TYPE'].unique())
-        variables['Num_class'] = num_class
-        variables['Num_type'] = num_type
+    # POI diversity
+    # Number of CLASS and TYPE
+    num_class = len(facilities_1km['CLASS'].unique())
+    num_type = len(facilities_1km['TYPE'].unique())
+    variables['Num_class'] = num_class
+    variables['Num_type'] = num_type
 
-        # Entropy-based CLASS diversity
-        class_unique_num = facilities_1km['CLASS'].value_counts()
-        class_unique_percentage = class_unique_num / class_unique_num.sum()
-        class_unique_percentage = class_unique_percentage.tolist()
-        class_entropy = entropy(class_unique_percentage, base=2)  # CLASS_Entropy
-        variables['Class_diversity'] = class_entropy
+    # Entropy-based CLASS diversity
+    class_unique_num = facilities_1km['CLASS'].value_counts()
+    class_unique_percentage = class_unique_num / class_unique_num.sum()
+    class_unique_percentage = class_unique_percentage.tolist()
+    class_entropy = entropy(class_unique_percentage, base=2)  # CLASS_Entropy
+    variables['Class_diversity'] = class_entropy
 
-        # Entropy-based TYPE diversity
-        type_unique_num = facilities_1km['TYPE'].value_counts()
-        type_unique_percentage = type_unique_num / type_unique_num.sum()
-        type_unique_percentage = type_unique_percentage.tolist()
-        type_entropy = entropy(type_unique_percentage, base=2)  # TYPE_Entropy
-        variables['Type_diversity'] = type_entropy
+    # Entropy-based TYPE diversity
+    type_unique_num = facilities_1km['TYPE'].value_counts()
+    type_unique_percentage = type_unique_num / type_unique_num.sum()
+    type_unique_percentage = type_unique_percentage.tolist()
+    type_entropy = entropy(type_unique_percentage, base=2)  # TYPE_Entropy
+    variables['Type_diversity'] = type_entropy
 
-        # Distance to the nearest unique TYPE of facility
-        facility_type = facilities_1km['TYPE'].unique()
-        for j in range(len(facility_type)):
-            distance = facilities_1km[facilities_1km['TYPE'] == facility_type[j]]['distance'].min()
-            variables[facility_type[j]] = distance
-            variables[facility_type[j] + '_walk'] = 1 if distance < threshold else 0
+    # Distance to the nearest unique TYPE of facility
+    facility_type = facilities_1km['TYPE'].unique()
+    for j in range(len(facility_type)):
+        distance = facilities_1km[facilities_1km['TYPE'] == facility_type[j]]['distance'].min()
+        variables[facility_type[j]] = distance
+        variables[facility_type[j] + '_walk'] = 1 if distance < threshold else 0
 
-        results.append(variables)
+    return variables
 
-    df = pd.concat([pd.DataFrame(l, index=[0]) for l in results], axis=0, ignore_index=True)
+
+def parallel_computing(worker, data, facility, wifi, threshold):
+    # Assign the core missions
+
+    iter_num = len(data) // worker
+    fun_partial = partial(facility_variables, data=data, facility=facility, wifi=wifi, threshold=threshold)
+
+    info = []
+    for i in tqdm(range(iter_num+1)):
+
+        if (i+1)*worker <= len(data):
+            iter_term = [i*worker+num for num in range(worker)]
+        else:
+            iter_term = [num for num in range(i*worker, len(data))]
+
+        # Construct the variables
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker) as executor:
+            results = executor.map(fun_partial, iter_term)
+            for result in results:
+                info.append(result)
+
+    tf = Transformer.from_crs('epsg:2326', 'epsg:4326', always_xy=True)
+    data['Longitude'] = data.apply(lambda x: tf.transform(x['x'], x['y'])[0], axis=1)
+    data['Latitude'] = data.apply(lambda x: tf.transform(x['x'], x['y'])[1], axis=1)
+
+    df = pd.concat([pd.DataFrame(l, index=[0]) for l in info], axis=0, ignore_index=True)
     df = pd.concat([data, df], axis=1)
-
-    df.to_csv('data_variables.csv', index=False)
+    df.to_csv('spatial_variables.csv', index=False)
 
 
 if __name__ == "__main__":
@@ -198,9 +221,9 @@ if __name__ == "__main__":
     facility_data = pd.read_csv('GeoCom4.0_202203.csv', low_memory=False)
     wifi_data = pd.read_csv('WIFI_HK.csv', low_memory=False)
     walk_threshold = 400
+    processor = 8
 
-    # Construct the variables
-    distance_facility(property_data, facility_data, wifi_data, walk_threshold)
+    parallel_computing(processor, property_data, facility_data, wifi_data, walk_threshold)
 
 
 
