@@ -34,8 +34,14 @@ import concurrent.futures
 from functools import partial
 import warnings
 from datetime import datetime, timedelta
+from sklearn.model_selection import train_test_split
+import math
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
 
+np.set_printoptions(suppress=True)
 warnings.filterwarnings('ignore')
 
 '''
@@ -68,9 +74,9 @@ def data_processing(data):
     # delete missing values of GFA and SFA
     df = df.drop(df[(df['GFA'] == '--') & (df['SFA'] == '--')].index)
     df['Area'] = df.apply(lambda x: x.GFA if x.GFA != '--' else x.SFA, axis=1)
+    data.dropna(subset=['Floor'], inplace=True)
 
     df = df.drop(['GFA', 'SFA', 'Change', 'GFA Price', 'SFA Price'], axis=1)
-
     df.to_csv('data.csv', index=False, encoding='utf_8_sig')
 
 
@@ -222,17 +228,23 @@ Variable Creation and Algorithm Design
 '''
 
 
-def gtwr_knn(data, threshold, spatial, temporal):
-    # variable creation: select the independent and dependent variables
-    # This is mainly about the POI related variables
+def knn_benchmark(data, threshold):
+    data.dropna(subset=['Floor'], inplace=True)
 
     # POIs that significantly affect the housing prices
     selected_poi = ['MAL', 'SMK', 'KDG', 'PRS', 'SES', 'PAR', 'PLG', 'RGD', 'BUS', 'MIN', 'CPO', 'MTA']
     for i, poi in enumerate(selected_poi):
-        data[poi+'_Walk'] = data.apply(lambda x: 1 if x[poi] <= threshold else 0, axis=1)
+        data[poi + '_Walk'] = data.apply(lambda x: 1 if x[poi] <= threshold else 0, axis=1)
 
     # define the x and y variables
-    x_variables = ['Date',
+    data['Date'] = pd.to_datetime(data['Date'], format='%d/%m/%Y')
+
+    data['Year'] = data['Date'].dt.year
+    data['Month'] = data['Date'].dt.month
+    data['Day'] = data['Date'].dt.day
+
+    x_variables = ['Month',
+                   'Day',
                    'Floor',
                    'Area',
                    'x',
@@ -242,27 +254,97 @@ def gtwr_knn(data, threshold, spatial, temporal):
                    'Num_class',
                    'Num_type',
                    'Class_diversity',
-                   'Type_diversity'] + [j+'_Walk' for j in selected_poi]
+                   'Type_diversity'] + [j + '_Walk' for j in selected_poi]
     y_variable = ['Price']
 
-    x = data[x_variables]
-    y = data[y_variable]
+    train_test_data = pd.concat([data[x_variables], data[y_variable]], axis=1)
 
-    # Initial selection
-    for i in range(len(data)):
-        # Use drop function to obtain all properties except the target one
-        other_properties = data.drop(i)
+    x = train_test_data[x_variables]
+    y = train_test_data[y_variable]
+
+    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.3, random_state=0)
+    model = KNeighborsRegressor(n_neighbors=5, weights='uniform')
+    model.fit(x_train, y_train)
+    y_pred = model.predict(x_test)
+    result = r2_score(y_test, y_pred)
+    print(result)
+
+
+def data_split(data, threshold):
+    # variable creation: select the independent and dependent variables
+    # This is mainly about the POI related variables
+
+    # POIs that significantly affect the housing prices
+    selected_poi = ['MAL', 'SMK', 'KDG', 'PRS', 'SES', 'PAR', 'PLG', 'RGD', 'BUS', 'MIN', 'CPO', 'MTA']
+    for i, poi in enumerate(selected_poi):
+        data[poi + '_Walk'] = data.apply(lambda x: 1 if x[poi] <= threshold else 0, axis=1)
+
+    # define the x and y variables
+    x_variables = ['Date',
+                   'Latitude',
+                   'Longitude',
+                   'Floor',
+                   'Area',
+                   'x',
+                   'y',
+                   'wifi_hk',
+                   'POI_density',
+                   'Num_class',
+                   'Num_type',
+                   'Class_diversity',
+                   'Type_diversity'] + [j + '_Walk' for j in selected_poi]
+
+    y_variable = ['Price']
+    train_test_data = pd.concat([data[x_variables], data[y_variable]], axis=1)
+
+    # Standardize the data
+    scaled_train_test_data = pd.DataFrame(StandardScaler().fit_transform(train_test_data.iloc[:, 3:]),
+                                          columns=train_test_data.columns[3:])
+
+    train_test_data = pd.concat([train_test_data.iloc[:, :3], scaled_train_test_data], axis=1)
+
+    x = train_test_data[x_variables]
+    y = train_test_data[y_variable]
+
+    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.3, random_state=0)
+
+    train = pd.concat([x_train, y_train], axis=1)
+    test = pd.concat([x_test, y_test], axis=1)
+
+    return train, test
+
+
+def gtwr_knn(train, spatial, temporal, weight_function, n_neighbors):
+
+    """
+    Training process
+    """
+    pred = []
+    test = []
+    train = train.reset_index(drop=True)
+    train['Date'] = pd.to_datetime(train['Date'], format='%d/%m/%Y')
+    for i in tqdm(range(10)):
+        """
+        SELECTION 选择
+        """
+
+        '''Initial selection 选择时空相近的个体'''
+        # target property
+        target_property = train.iloc[i, :]
+
+        # Other properties
+        other_properties = train.drop(i)
 
         # Spatial_proximity
-        rectangle_properties = other_properties[(other_properties['x'] <= data.loc[i, 'x'] + spatial) &
-                                                (other_properties['x'] >= data.loc[i, 'x'] - spatial)&
-                                                (other_properties['y'] <= data.loc[i, 'y'] + spatial)&
-                                                (other_properties['y'] >= data.loc[i, 'y'] - spatial)]
+        rectangle_properties = other_properties[(other_properties['x'] <= target_property['x'] + spatial) &
+                                                (other_properties['x'] >= target_property['x'] - spatial) &
+                                                (other_properties['y'] <= target_property['y'] + spatial) &
+                                                (other_properties['y'] >= target_property['y'] - spatial)]
 
-        rectangle_properties['distance'] = rectangle_properties.apply(lambda x: geodesic((data.loc[i, 'Latitude'],
-                                                                      data.loc[i, 'Longitude']),
+        rectangle_properties['distance'] = rectangle_properties.apply(lambda x: geodesic((target_property['Latitude'],
+                                                                      target_property['Longitude']),
                                                                       (x['Latitude'],
-                                                                      x['Longitude'])).m,
+                                                                       x['Longitude'])).m,
                                                                       axis=1)
 
         spatial_properties = rectangle_properties[rectangle_properties['distance'] <= spatial]
@@ -270,18 +352,112 @@ def gtwr_knn(data, threshold, spatial, temporal):
         # Temporal_proximity
         spatial_properties['Date'] = pd.to_datetime(spatial_properties['Date'], format='%d/%m/%Y')
 
-        # Temporal gap
+        # Temporal gap: needs to be larger to cover more data
         delta = timedelta(days=temporal)
 
-        transaction_date = datetime.strptime(data.loc[i, 'Date'], '%d/%m/%Y')
+        transaction_date = target_property['Date']
         start_time = transaction_date - delta
 
         # Select the properties within the selected time period
-        spatial_temporal_properties = spatial_properties[(spatial_properties['Date'] >= start_time) &
-                                                         (spatial_properties['Date'] <= transaction_date)].reset_index(drop=True)
-        spatial_temporal_properties['time'] = spatial_temporal_properties.apply(lambda x: (transaction_date-x['Date']).total_seconds()/86400, axis=1)
-        print(spatial_temporal_properties)
-        break
+        try:
+            spatial_temporal_properties = spatial_properties[(spatial_properties['Date'] >= start_time) &
+                                                             (spatial_properties['Date'] <= transaction_date)
+                                                             ].reset_index(drop=True)
+
+            spatial_temporal_properties['time'] = spatial_temporal_properties.apply(
+                lambda x: (transaction_date-x['Date']).total_seconds()/86400, axis=1)
+
+        except ValueError:
+            spatial_temporal_properties = spatial_properties
+
+        '''KNN selection 选择属性相似的个体'''
+        # Attribute similarity calculation
+        initial_selection = spatial_temporal_properties.iloc[:, 3:]
+        sub_result = initial_selection.sub(target_property[3:])
+
+        # Attribute distance calculation (Euclidean distance or Cosine similarity)
+        initial_selection['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x**2)), axis=1)
+
+        if len(initial_selection) > n_neighbors:
+            # Select the most similar properties
+            initial_selection_neighbors = initial_selection.nsmallest(n_neighbors, 'attribute_distance')
+        else:
+            initial_selection_neighbors = initial_selection
+
+        '''
+        ADJUSTMENT 
+        对于选择得到的个体表现进行预测
+        '''
+
+        '''GTWR Weight Creation 创建GTWR权重函数'''
+
+        # Gaussian weight function
+        if weight_function == "Gaussian":
+            try:
+                # Spatial Weight Calculation
+                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
+                    lambda x: math.exp(-np.square(x['distance'] / spatial_bandwidth)), axis=1)
+
+                # Temporal Weight Calculation
+                initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
+                    lambda x: math.exp(-np.square(x['time'] / temporal_bandwidth)), axis=1)
+
+                # GTWR Weight Calculation
+                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
+                    lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
+
+            except KeyError:
+                # Spatial Weight Calculation
+                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
+                    lambda x: math.exp(-np.square(x['distance'] / spatial_bandwidth)), axis=1)
+
+                # GTWR Weight Calculation
+                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
+                    lambda x: x['spatial_weight'], axis=1)
+
+        # Bi-Square Weight Function
+        elif weight_function == "Bi-Square":
+            try:
+                # Spatial Weight Calculation
+                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
+                    lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial_bandwidth))), axis=1)
+
+                # Temporal Weight Calculation
+                initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
+                    lambda x: np.square(1 - math.exp(np.square(x['time']) / np.square(temporal_bandwidth))), axis=1)
+
+                # GTWR Weight Calculation
+                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
+                    lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
+
+            except KeyError:
+                # Spatial Weight Calculation
+                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
+                    lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial_bandwidth))), axis=1)
+
+                # GTWR Weight Calculation
+                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
+                    lambda x: x['spatial_weight'], axis=1)
+
+        # Standardization of the GTWR weights
+        # MinMax Scaler
+        standardized_data = MinMaxScaler().fit_transform(initial_selection_neighbors['GTWR_weight'].values.reshape(-1, 1))
+        initial_selection_neighbors['GTWR_weight_standard'] = standardized_data
+
+        ''' 
+        Value aggregation 整合选择得到的个体表现得到预测值
+        '''
+        weight = initial_selection_neighbors.loc[:, 'GTWR_weight_standard'].reset_index(drop=True)
+        price = initial_selection_neighbors.loc[:, 'Price'].reset_index(drop=True)
+        predicted_price = weight.dot(price)
+        pred.append(predicted_price)
+        test.append(target_property['Price'])
+
+    # Training results
+    training_results ={'MAE': mean_absolute_error(test, pred),
+                       'RMSE': math.sqrt(mean_squared_error(test, pred))
+                      }
+    print(training_results)
 
 
 if __name__ == "__main__":
@@ -296,11 +472,15 @@ if __name__ == "__main__":
 
     # GTWR-based algorithm design
     walk_threshold = 400
-    spatial_bandwidth = 500
-    temporal_bandwidth = 30
-    data = pd.read_csv('data_variables.csv', encoding='unicode_escape')
-    gtwr_knn(data, walk_threshold, spatial_bandwidth, temporal_bandwidth)
+    spatial_bandwidth = 1000
+    temporal_bandwidth = 15
+    n_neighbors = 12
 
+    data = pd.read_csv('data_variables.csv', encoding='unicode_escape')
+    # knn_benchmark(data, walk_threshold)
+    train_data = data_split(data, walk_threshold)[0]
+
+    gtwr_knn(train_data, spatial_bandwidth, temporal_bandwidth, 'Bi-Square', n_neighbors=n_neighbors)
 
 
 
