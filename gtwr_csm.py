@@ -323,7 +323,8 @@ def gtwr_knn(train, spatial, temporal, weight_function, n_neighbors):
     test = []
     train = train.reset_index(drop=True)
     train['Date'] = pd.to_datetime(train['Date'], format='%d/%m/%Y')
-    for i in tqdm(range(10)):
+
+    for i in tqdm(range(len(train))):
         """
         SELECTION 选择
         """
