@@ -554,7 +554,7 @@ def gtwr_knn(train, num, spatial, temporal, weight_function, n_neighbors):
             initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
                 lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
 
-        except KeyError:
+        except Exception:
             # Spatial Weight Calculation
             initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
                 lambda x: math.exp(-np.square(x['distance'] / spatial)), axis=1)
@@ -578,7 +578,7 @@ def gtwr_knn(train, num, spatial, temporal, weight_function, n_neighbors):
             initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
                 lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
 
-        except KeyError:
+        except Exception:
             # Spatial Weight Calculation
             initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
                 lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial))), axis=1)
@@ -620,8 +620,8 @@ if __name__ == "__main__":
     # candidate for grid search (30, 45, 60, 75, 90)
     temporal_bandwidth = 45
 
-    # candidate for grid search (5, 10, 15, 20)
-    n_neighbors = 10
+    # candidate for grid search (5, 10, 15)
+    n_neighbors = 5
 
     data = pd.read_csv('data_variables.csv', encoding='unicode_escape')
     # knn_benchmark(data, walk_threshold)
@@ -639,7 +639,7 @@ if __name__ == "__main__":
     # 创建一个进程池
 
     # VERY IMPORTANT: check how many cores in your PC
-    pool = multiprocessing.Pool(processes=8)
+    pool = multiprocessing.Pool(processes=6)
 
     # 定义一个列表来存储每次循环的结果
     results = []
@@ -660,13 +660,15 @@ if __name__ == "__main__":
     pred_results = []
     # 打印每次循环的结果
     for result in results:
-        pred_results.append(result.get())
-    true_results = train_data.iloc[::, -1].tolist()
-    train_performance = model_performance(pred_results, true_results)
-    print(train_performance)
+        try:
+            pred_results.append(result.get())
+        except Exception:
+            pass
 
     pred_results = pd.DataFrame(pred_results)
-    pred_results.to_csv('prediction_results.csv', index=False, header=False)
+    pred_results.to_csv('spatial_{}_temporal_{}_n_{}_prediction_results.csv'.
+                        format(spatial_bandwidth, temporal_bandwidth, n_neighbors),
+                        index=False, header=False)
 
 
 
