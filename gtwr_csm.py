@@ -587,13 +587,13 @@ if __name__ == "__main__":
     walk_threshold = 400
 
     # candidate for grid search (500, 750, 1000, 1500, 2000)
-    spatial_bandwidth = 1000
+    spatial_bandwidth_candidates = [500, 750, 1000, 1500, 2000]
 
     # candidate for grid search (30, 45, 60, 75, 90)
-    temporal_bandwidth = 45
+    temporal_bandwidth_candidates = [30, 45, 60, 75, 90]
 
     # candidate for grid search (5, 10, 15)
-    n_neighbors = 10
+    n_neighbors = [5, 10, 15]
 
     data = pd.read_csv('data_variables.csv', encoding='unicode_escape')
 
@@ -601,40 +601,52 @@ if __name__ == "__main__":
 
     train_data = data_split(data, walk_threshold)[0]
 
-    '''
-    Parallel Computing 并行计算进行结果预测
-    '''
-    data_count = len(train_data)
-    pbar = tqdm(total=data_count)
-    pbar.set_description('GTWR_KNN')
-    update = lambda *args: pbar.update()
+    # Grid search 循环
+    for i in spatial_bandwidth_candidates:
+        for j in temporal_bandwidth_candidates:
+            for k in n_neighbors:
+                '''
+                Parallel Computing 并行计算进行结果预测
+                '''
+                data_count = len(train_data)
+                pbar = tqdm(total=data_count)
+                pbar.set_description('GTWR_KNN')
+                update = lambda *args: pbar.update()
 
-    # VERY IMPORTANT: check how many cores in your PC
-    pool = multiprocessing.Pool(processes=8)
+                # VERY IMPORTANT: check how many cores in your PC
+                pool = multiprocessing.Pool(processes=4)
 
-    # 定义一个列表来存储每次循环的结果
-    results = []
+                # 定义一个列表来存储每次循环的结果
+                results = []
 
-    # 并行运行for循环
-    for num in range(data_count):
-        # 将任务提交给进程池
-        result = pool.apply_async(gtwr_knn,
-                                  args=(train_data, num, spatial_bandwidth, temporal_bandwidth, 'Bi-Square', n_neighbors),
-                                  callback=update)
-        results.append(result)
+                # 并行运行for循环
+                for num in range(data_count):
+                    # 将任务提交给进程池
+                    result = pool.apply_async(gtwr_knn,
+                                              args=(train_data,
+                                                    num,
+                                                    i,
+                                                    j,
+                                                    'Bi-Square',
+                                                    k),
+                                              callback=update)
+                    results.append(result)
 
-    # 等待所有进程完成
-    pool.close()
-    pool.join()
-    # print('Time: {} seconds'.format(time.time()-start))
+                # 等待所有进程完成
+                pool.close()
+                pool.join()
+                # print('Time: {} seconds'.format(time.time()-start))
 
-    pred_results = []
-    # 打印每次循环的结果
-    for result in results:
-            pred_results.append(result.get())
+                pred_results = []
+                # 打印每次循环的结果
+                for result in results:
+                    pred_results.append(result.get())
 
-    pred_results = pd.DataFrame(pred_results)
+                pred_results = pd.DataFrame(pred_results)
 
-    pred_results.to_csv('spatial_{}_temporal_{}_n_{}_prediction_results.csv'.
-                        format(spatial_bandwidth, temporal_bandwidth, n_neighbors),
-                        index=False, header=False)
+                pred_results.to_csv('spatial_{}_temporal_{}_n_{}_prediction_results.csv'.
+                                    format(i,
+                                           j,
+                                           k),
+                                    index=False,
+                                    header=False)
