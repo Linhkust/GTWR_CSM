@@ -235,9 +235,12 @@ def knn_benchmark(data, threshold):
     model = KNeighborsRegressor(n_neighbors=5, weights='uniform')
     model.fit(x_train, y_train)
     y_pred = model.predict(x_test)
+
     result1 = mean_absolute_error(y_test[:100], y_pred[:100])
     result2 = math.sqrt(mean_squared_error(y_test[:100], y_pred[:100]))
-    print(result1, result2)
+    result = {'MAE': "%.2f" % result1, 'RMSE': "%.2f" % result2}
+    print(result)
+    return result
 
 
 def data_split(data, threshold):
@@ -426,8 +429,8 @@ def serial_gtwr_knn(train, spatial, temporal, weight_function, n_neighbors):
 
 def model_performance(test, pred):
     # Training results
-    training_results ={'MAE': mean_absolute_error(test, pred),
-                       'RMSE': math.sqrt(mean_squared_error(test, pred))
+    training_results ={'MAE': "%.2f" % mean_absolute_error(test, pred),
+                       'RMSE': "%.2f" % math.sqrt(mean_squared_error(test, pred))
                       }
     return training_results
 
@@ -582,6 +585,179 @@ def gtwr_knn(train, num, spatial, temporal, weight_function, n_neighbors):
     return predicted_price
 
 
+# Using test data to predict
+def test_gtwr_knn(train, test, num, spatial, temporal, weight_function, n_neighbors):
+    test = test.reset_index(drop=True)
+
+    train['Date'] = pd.to_datetime(train['Date'], format='%d/%m/%Y')
+    test['Date'] = pd.to_datetime(test['Date'], format='%d/%m/%Y')
+
+    """
+    SELECTION 选择
+    """
+
+    '''Initial selection 选择时空相近的个体'''
+    # target property
+    target_property = test.iloc[num, :]
+
+    # Other properties
+    other_properties = train
+
+    # Spatial_proximity
+    rectangle_properties = other_properties[(other_properties['x'] <= target_property['x'] + spatial) &
+                                            (other_properties['x'] >= target_property['x'] - spatial) &
+                                            (other_properties['y'] <= target_property['y'] + spatial) &
+                                            (other_properties['y'] >= target_property['y'] - spatial)]
+
+    rectangle_properties['distance'] = rectangle_properties.apply(lambda x: geodesic((
+        target_property['Latitude'],
+        target_property['Longitude']),
+        (x['Latitude'],
+         x['Longitude'])).m,
+        axis=1)
+
+    spatial_properties = rectangle_properties[rectangle_properties['distance'] <= spatial]
+
+    # 如果地理范围内存在数据
+    if len(spatial_properties) > 0:
+
+        # Temporal gap: needs to be larger to cover more data
+        delta = timedelta(days=temporal)
+
+        transaction_date = target_property['Date']
+        start_time = transaction_date - delta
+
+        # Select the properties within the selected time period
+        try:
+            spatial_temporal_properties = spatial_properties[(spatial_properties['Date'] >= start_time) &
+                                                             (spatial_properties['Date'] <= transaction_date)
+                                                             ].reset_index(drop=True)
+
+            spatial_temporal_properties['time'] = spatial_temporal_properties.apply(
+                lambda x: (transaction_date - x['Date']).total_seconds() / 86400, axis=1)
+
+        except ValueError:
+            spatial_temporal_properties = spatial_properties
+
+        '''KNN selection 选择属性相似的个体'''
+        # Attribute similarity calculation
+        initial_selection = spatial_temporal_properties.iloc[:, 3:]
+        sub_result = initial_selection.sub(target_property[3:])
+
+        # Attribute distance calculation (Euclidean distance or Cosine similarity)
+        initial_selection['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x ** 2)), axis=1)
+
+        if len(initial_selection) > n_neighbors:
+            # Select the most similar properties
+            initial_selection_neighbors = initial_selection.nsmallest(n_neighbors, 'attribute_distance')
+        else:
+            initial_selection_neighbors = initial_selection
+
+
+        '''
+        ADJUSTMENT 
+        对于选择得到的个体表现进行预测
+        '''
+
+        '''GTWR Weight Creation 创建GTWR权重函数'''
+
+        # Gaussian weight function
+        if weight_function == "Gaussian":
+            try:
+                # Spatial Weight Calculation
+                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
+                    lambda x: math.exp(-np.square(x['distance'] / spatial)), axis=1)
+
+                # Temporal Weight Calculation
+                initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
+                    lambda x: math.exp(-np.square(x['time'] / temporal)), axis=1)
+
+                # GTWR Weight Calculation
+                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
+                    lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
+
+            except Exception:
+                # Spatial Weight Calculation
+                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
+                    lambda x: math.exp(-np.square(x['distance'] / spatial)), axis=1)
+
+                # GTWR Weight Calculation
+                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
+                    lambda x: x['spatial_weight'], axis=1)
+
+        # Bi-Square Weight Function
+        elif weight_function == "Bi-Square":
+            try:
+                # Spatial Weight Calculation
+                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
+                    lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial))), axis=1)
+
+                # Temporal Weight Calculation
+                initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
+                    lambda x: np.square(1 - math.exp(np.square(x['time']) / np.square(temporal))), axis=1)
+
+                # GTWR Weight Calculation
+                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
+                    lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
+
+            except Exception:
+                # Spatial Weight Calculation
+                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
+                    lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial))), axis=1)
+
+                # GTWR Weight Calculation
+                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
+                    lambda x: x['spatial_weight'], axis=1)
+
+        # Standardization of the GTWR weights
+        # MinMax Scaler
+        standardized_data = MinMaxScaler().fit_transform(
+            initial_selection_neighbors['GTWR_weight'].values.reshape(-1, 1))
+
+        initial_selection_neighbors['GTWR_weight_standard'] = standardized_data
+
+        ''' 
+        Value aggregation 整合选择得到的个体表现得到预测值
+        '''
+        weight = initial_selection_neighbors.loc[:, 'GTWR_weight_standard'].reset_index(drop=True)
+        price = initial_selection_neighbors.loc[:, 'Price'].reset_index(drop=True)
+        predicted_price = weight.dot(price)
+
+    # 如果地理范围内不存在数据，采用属性KNN计算
+    else:
+        # Attribute similarity calculation
+        initial_selection = other_properties.iloc[:, 3:]
+        sub_result = initial_selection.sub(target_property[3:])
+
+        # Attribute distance calculation (Euclidean distance or Cosine similarity)
+        initial_selection['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x ** 2)), axis=1)
+        initial_selection_neighbors = initial_selection.nsmallest(n_neighbors, 'attribute_distance')
+        price = initial_selection_neighbors.loc[:, 'Price'].reset_index(drop=True)
+        predicted_price = price.mean()
+
+    return predicted_price
+
+
+# Model training and testing
+def main():
+    pred_train1 = pd.read_csv('spatial_500_temporal_30_n_5_prediction_results.csv', encoding='unicode_escape',
+                              header=None)
+
+    pred_train2 = pd.read_csv('spatial_500_temporal_30_n_10_prediction_results.csv', encoding='unicode_escape',
+                              header=None)
+
+    pred_train3 = pd.read_csv('spatial_500_temporal_30_n_15_prediction_results.csv', encoding='unicode_escape',
+                              header=None)
+
+    pred_train4 = pd.read_csv('spatial_500_temporal_45_n_5_prediction_results.csv', encoding='unicode_escape',
+                              header=None)
+
+    print(model_performance(train_data.iloc[:, -1], pred_train1))
+    print(model_performance(train_data.iloc[:, -1], pred_train2))
+    print(model_performance(train_data.iloc[:, -1], pred_train3))
+    print(model_performance(train_data.iloc[:, -1], pred_train4))
+
+
 if __name__ == "__main__":
     # GTWR-based algorithm design
     walk_threshold = 400
@@ -596,57 +772,97 @@ if __name__ == "__main__":
     n_neighbors = [5, 10, 15]
 
     data = pd.read_csv('data_variables.csv', encoding='unicode_escape')
+    train_data = data_split(data, walk_threshold)[0]
+    test_data = data_split(data, walk_threshold)[1]
 
     # knn_benchmark(data, walk_threshold)
 
-    train_data = data_split(data, walk_threshold)[0]
-
     # Grid search 循环
-    for i in spatial_bandwidth_candidates:
-        for j in temporal_bandwidth_candidates:
-            for k in n_neighbors:
-                '''
-                Parallel Computing 并行计算进行结果预测
-                '''
-                data_count = len(train_data)
-                pbar = tqdm(total=data_count)
-                pbar.set_description('GTWR_KNN')
-                update = lambda *args: pbar.update()
+    # for i in spatial_bandwidth_candidates:
+    #     for j in temporal_bandwidth_candidates:
+    #         for k in n_neighbors:
+    #             '''
+    #             Parallel Computing 并行计算进行训练
+    #             '''
+    #             data_count = len(train_data)
+    #             pbar = tqdm(total=data_count)
+    #             pbar.set_description('GTWR_KNN')
+    #             update = lambda *args: pbar.update()
+    #
+    #             # VERY IMPORTANT: check how many cores in your PC
+    #             pool = multiprocessing.Pool(processes=4)
+    #
+    #             # 定义一个列表来存储每次循环的结果
+    #             results = []
+    #
+    #             # 并行运行for循环
+    #             for num in range(data_count):
+    #                 # 将任务提交给进程池
+    #                 result = pool.apply_async(gtwr_knn,
+    #                                           args=(train_data,
+    #                                                 num,
+    #                                                 i,
+    #                                                 j,
+    #                                                 'Bi-Square',
+    #                                                 k),
+    #                                           callback=update)
+    #                 results.append(result)
+    #
+    #             # 等待所有进程完成
+    #             pool.close()
+    #             pool.join()
+    #             # print('Time: {} seconds'.format(time.time()-start))
+    #
+    #             pred_results = []
+    #             # 打印每次循环的结果
+    #             for result in results:
+    #                 pred_results.append(result.get())
+    #
+    #             pred_results = pd.DataFrame(pred_results)
+    #
+    #             pred_results.to_csv('spatial_{}_temporal_{}_n_{}_prediction_results.csv'.
+    #                                 format(i,
+    #                                        j,
+    #                                        k),
+    #                                 index=False,
+    #                                 header=False)
 
-                # VERY IMPORTANT: check how many cores in your PC
-                pool = multiprocessing.Pool(processes=4)
+    '''
+    Parallel Computing 并行计算进行结果预测
+    '''
+    data_count = len(test_data)
+    pbar = tqdm(total=data_count)
+    pbar.set_description('GTWR_KNN_Testing')
+    update = lambda *args: pbar.update()
 
-                # 定义一个列表来存储每次循环的结果
-                results = []
+    # VERY IMPORTANT: check how many cores in your PC
+    pool = multiprocessing.Pool(processes=8)
 
-                # 并行运行for循环
-                for num in range(data_count):
-                    # 将任务提交给进程池
-                    result = pool.apply_async(gtwr_knn,
-                                              args=(train_data,
-                                                    num,
-                                                    i,
-                                                    j,
-                                                    'Bi-Square',
-                                                    k),
-                                              callback=update)
-                    results.append(result)
+    # 定义一个列表来存储每次循环的结果
+    results = []
 
-                # 等待所有进程完成
-                pool.close()
-                pool.join()
-                # print('Time: {} seconds'.format(time.time()-start))
+    # 并行运行for循环
+    for num in range(data_count):
+        # 将任务提交给进程池
+        result = pool.apply_async(test_gtwr_knn,
+                                  args=(train_data,
+                                        test_data,
+                                        num,
+                                        500,
+                                        45,
+                                        'Bi-Square',
+                                        5),
+                                  callback=update)
+        results.append(result)
 
-                pred_results = []
-                # 打印每次循环的结果
-                for result in results:
-                    pred_results.append(result.get())
+    # 等待所有进程完成
+    pool.close()
+    pool.join()
 
-                pred_results = pd.DataFrame(pred_results)
+    pred_results = []
+    # 打印每次循环的结果
+    for result in results:
+        pred_results.append(result.get())
 
-                pred_results.to_csv('spatial_{}_temporal_{}_n_{}_prediction_results.csv'.
-                                    format(i,
-                                           j,
-                                           k),
-                                    index=False,
-                                    header=False)
+    pred_results = pd.DataFrame(pred_results)
+    print(model_performance(test_data.iloc[:, -1], pd.DataFrame(pred_results)))
