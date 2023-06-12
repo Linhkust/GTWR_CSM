@@ -37,7 +37,7 @@ import math
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-import swifter
+import sys
 
 np.set_printoptions(suppress=True)
 warnings.filterwarnings('ignore')
@@ -156,6 +156,7 @@ def facility_variables(row, data, facility, wifi):
 
     facilities_1km = facility_selection[facility_selection['distance'] <= 1000][['GEONAMEID', 'CLASS', 'TYPE', 'distance']].reset_index(drop=True)
 
+    # Generated Features
     variables = {}
 
     # POI density
@@ -189,7 +190,56 @@ def facility_variables(row, data, facility, wifi):
     for j in range(len(facility_type)):
         distance = facilities_1km[facilities_1km['TYPE'] == facility_type[j]]['distance'].min()
         variables[facility_type[j]] = distance
+
     return variables
+
+
+# Parallel operation for feature generation
+def parallel_feature_generation(data, facility, wifi):
+    # Testing
+    data_count = len(data)
+    pbar = tqdm(total=data_count, file=sys.stdout, colour='white')
+    pbar.set_description('Feature Generation')
+    update = lambda *args: pbar.update()
+
+    # VERY IMPORTANT: check how many cores in your PC
+    pool = multiprocessing.Pool(processes=12)
+
+    # 定义一个列表来存储每次循环的结果
+    results = []
+
+    # 并行运行for循环
+    for num in range(data_count):
+        # 将任务提交给进程池
+        result = pool.apply_async(facility_variables,
+                                  args=(num,
+                                        data,
+                                        facility,
+                                        wifi),
+                                  callback=update)
+        results.append(result)
+
+    # 等待所有进程完成
+    pool.close()
+    pool.join()
+
+    pred_results = []
+    # 打印每次循环的结果
+    for result in results:
+        pred_results.append(result.get())
+
+    pred_results = pd.DataFrame(pred_results)
+
+    # HKGrid1980 to WGS84
+    tf = Transformer.from_crs('epsg:2326', 'epsg:4326', always_xy=True)
+
+    # Add geographic coordinates
+    data['Longitude'] = data.apply(lambda x: tf.transform(x['x'], x['y'])[0], axis=1)
+    data['Latitude'] = data.apply(lambda x: tf.transform(x['x'], x['y'])[1], axis=1)
+
+    # Combine property information and facility information
+    final_data = pd.concat([data, pred_results], axis=1)
+    final_data.to_csv('data_features.csv', index=False)
 
 
 '''
@@ -197,7 +247,7 @@ Variable Creation and Algorithm Design
 '''
 
 
-def knn_benchmark(data, threshold):
+def knn_benchmark(data, threshold, n_neighbors):
     data.dropna(subset=['Floor'], inplace=True)
 
     # POIs that significantly affect the housing prices
@@ -232,7 +282,7 @@ def knn_benchmark(data, threshold):
     y = train_test_data[y_variable]
 
     x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.3, random_state=0)
-    model = KNeighborsRegressor(n_neighbors=5, weights='uniform')
+    model = KNeighborsRegressor(n_neighbors=n_neighbors, weights='uniform')
     model.fit(x_train, y_train)
     y_pred = model.predict(x_test)
 
@@ -256,10 +306,10 @@ def data_split(data, threshold):
     x_variables = ['Date',
                    'Latitude',
                    'Longitude',
-                   'Floor',
-                   'Area',
                    'x',
                    'y',
+                   'Floor',
+                   'Area',
                    'wifi_hk',
                    'POI_density',
                    'Num_class',
@@ -271,10 +321,10 @@ def data_split(data, threshold):
     train_test_data = pd.concat([data[x_variables], data[y_variable]], axis=1)
 
     # Standardize the data
-    scaled_train_test_data = pd.DataFrame(StandardScaler().fit_transform(train_test_data.iloc[:, 3:]),
-                                          columns=train_test_data.columns[3:])
+    scaled_train_test_data = pd.DataFrame(StandardScaler().fit_transform(train_test_data.iloc[:, 5:]),
+                                          columns=train_test_data.columns[5:])
 
-    train_test_data = pd.concat([train_test_data.iloc[:, :3], scaled_train_test_data], axis=1)
+    train_test_data = pd.concat([train_test_data.iloc[:, :5], scaled_train_test_data], axis=1)
 
     x = train_test_data[x_variables]
     y = train_test_data[y_variable]
@@ -287,146 +337,6 @@ def data_split(data, threshold):
     return train, test
 
 
-def serial_gtwr_knn(train, spatial, temporal, weight_function, n_neighbors):
-
-    """
-    Training process
-    """
-    train = train.reset_index(drop=True)
-    train['Date'] = pd.to_datetime(train['Date'], format='%d/%m/%Y')
-
-    for i in tqdm(range(len(train))):
-        """
-        SELECTION 选择
-        """
-
-        '''Initial selection 选择时空相近的个体'''
-        # target property
-        target_property = train.iloc[i, :]
-
-        # Other properties
-        other_properties = train.drop(i)
-
-        # Spatial_proximity
-        rectangle_properties = other_properties[(other_properties['x'] <= target_property['x'] + spatial) &
-                                                (other_properties['x'] >= target_property['x'] - spatial) &
-                                                (other_properties['y'] <= target_property['y'] + spatial) &
-                                                (other_properties['y'] >= target_property['y'] - spatial)]
-
-        rectangle_properties['distance'] = rectangle_properties.apply(lambda x: geodesic((target_property['Latitude'],
-                                                                      target_property['Longitude']),
-                                                                      (x['Latitude'],
-                                                                       x['Longitude'])).m,
-                                                                      axis=1)
-
-        spatial_properties = rectangle_properties[rectangle_properties['distance'] <= spatial]
-
-        # Temporal_proximity
-        spatial_properties['Date'] = pd.to_datetime(spatial_properties['Date'], format='%d/%m/%Y')
-
-        # Temporal gap: needs to be larger to cover more data
-        delta = timedelta(days=temporal)
-
-        transaction_date = target_property['Date']
-        start_time = transaction_date - delta
-
-        # Select the properties within the selected time period
-        try:
-            spatial_temporal_properties = spatial_properties[(spatial_properties['Date'] >= start_time) &
-                                                             (spatial_properties['Date'] <= transaction_date)
-                                                             ].reset_index(drop=True)
-
-            spatial_temporal_properties['time'] = spatial_temporal_properties.apply(
-                lambda x: (transaction_date-x['Date']).total_seconds()/86400, axis=1)
-
-        except ValueError:
-            spatial_temporal_properties = spatial_properties
-
-        '''KNN selection 选择属性相似的个体'''
-        # Attribute similarity calculation
-        initial_selection = spatial_temporal_properties.iloc[:, 3:]
-        sub_result = initial_selection.sub(target_property[3:])
-
-        # Attribute distance calculation (Euclidean distance or Cosine similarity)
-        initial_selection['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x**2)), axis=1)
-
-        if len(initial_selection) > n_neighbors:
-            # Select the most similar properties
-            initial_selection_neighbors = initial_selection.nsmallest(n_neighbors, 'attribute_distance')
-        else:
-            initial_selection_neighbors = initial_selection
-
-        '''
-        ADJUSTMENT 
-        对于选择得到的个体表现进行预测
-        '''
-
-        '''GTWR Weight Creation 创建GTWR权重函数'''
-
-        # Gaussian weight function
-        if weight_function == "Gaussian":
-            try:
-                # Spatial Weight Calculation
-                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
-                    lambda x: math.exp(-np.square(x['distance'] / spatial)), axis=1)
-
-                # Temporal Weight Calculation
-                initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
-                    lambda x: math.exp(-np.square(x['time'] / temporal)), axis=1)
-
-                # GTWR Weight Calculation
-                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
-                    lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
-
-            except KeyError:
-                # Spatial Weight Calculation
-                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
-                    lambda x: math.exp(-np.square(x['distance'] / spatial_bandwidth)), axis=1)
-
-                # GTWR Weight Calculation
-                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
-                    lambda x: x['spatial_weight'], axis=1)
-
-        # Bi-Square Weight Function
-        elif weight_function == "Bi-Square":
-            try:
-                # Spatial Weight Calculation
-                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
-                    lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial))), axis=1)
-
-                # Temporal Weight Calculation
-                initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
-                    lambda x: np.square(1 - math.exp(np.square(x['time']) / np.square(temporal))), axis=1)
-
-                # GTWR Weight Calculation
-                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
-                    lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
-
-            except KeyError:
-                # Spatial Weight Calculation
-                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
-                    lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial))), axis=1)
-
-                # GTWR Weight Calculation
-                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
-                    lambda x: x['spatial_weight'], axis=1)
-
-        # Standardization of the GTWR weights
-        # MinMax Scaler
-        standardized_data = MinMaxScaler().fit_transform(initial_selection_neighbors['GTWR_weight'].values.reshape(-1, 1))
-        initial_selection_neighbors['GTWR_weight_standard'] = standardized_data
-
-        ''' 
-        Value aggregation 整合选择得到的个体表现得到预测值
-        '''
-        weight = initial_selection_neighbors.loc[:, 'GTWR_weight_standard'].reset_index(drop=True)
-        price = initial_selection_neighbors.loc[:, 'Price'].reset_index(drop=True)
-        predicted_price = weight.dot(price)
-        print(predicted_price)
-        # pred.append(predicted_price)
-        # test.append(target_property['Price'])
-
-
 def model_performance(test, pred):
     # Training results
     training_results ={'MAE': "%.2f" % mean_absolute_error(test, pred),
@@ -435,9 +345,10 @@ def model_performance(test, pred):
     return training_results
 
 
-# Focus on specific sample
-def gtwr_knn(train, num, spatial, temporal, weight_function, n_neighbors):
+# Train the data to find the best parameters
+def gtwr_knn_training(train, num, spatial, temporal, gtwr_weight, n_neighbors, knn_weight):
 
+    global predicted_price
     train = train.reset_index(drop=True)
     train['Date'] = pd.to_datetime(train['Date'], format='%d/%m/%Y')
 
@@ -446,6 +357,7 @@ def gtwr_knn(train, num, spatial, temporal, weight_function, n_neighbors):
     """
 
     '''Initial selection 选择时空相近的个体'''
+
     # target property
     target_property = train.iloc[num, :]
 
@@ -458,135 +370,170 @@ def gtwr_knn(train, num, spatial, temporal, weight_function, n_neighbors):
                                             (other_properties['y'] <= target_property['y'] + spatial) &
                                             (other_properties['y'] >= target_property['y'] - spatial)]
 
-    rectangle_properties['distance'] = rectangle_properties.apply(lambda x: geodesic((
+    if len(rectangle_properties) > 0:
+        rectangle_properties['distance'] = rectangle_properties.apply(lambda x: geodesic((
                                                                                       target_property['Latitude'],
                                                                                       target_property['Longitude']),
                                                                                      (x['Latitude'],
                                                                                       x['Longitude'])).m,
                                                                                       axis=1)
+        # Select properties within the distance threshold
+        spatial_properties = rectangle_properties[rectangle_properties['distance'] <= spatial]
 
-    spatial_properties = rectangle_properties[rectangle_properties['distance'] <= spatial]
+        if len(spatial_properties) > 0:
 
-    # 如果地理范围内存在数据
-    if len(spatial_properties) > 0:
+            # Temporal gap: needs to be larger to cover more data
+            delta = timedelta(days=temporal)
 
-        # Temporal gap: needs to be larger to cover more data
-        delta = timedelta(days=temporal)
+            transaction_date = target_property['Date']
+            start_time = transaction_date - delta
 
-        transaction_date = target_property['Date']
-        start_time = transaction_date - delta
+            # Select the properties within the selected time period
+            # If there is no record with specific period, then choose the data with spatial threshold
 
-        # Select the properties within the selected time period
-        try:
             spatial_temporal_properties = spatial_properties[(spatial_properties['Date'] >= start_time) &
-                                                             (spatial_properties['Date'] <= transaction_date)
-                                                             ].reset_index(drop=True)
+                                                                 (spatial_properties['Date'] <= transaction_date)
+                                                                 ].reset_index(drop=True)
 
-            spatial_temporal_properties['time'] = spatial_temporal_properties.apply(
-                lambda x: (transaction_date - x['Date']).total_seconds() / 86400, axis=1)
+            # Data exists within a pre-determined temporal threshold
+            if len(spatial_temporal_properties) > 0:
+                spatial_temporal_properties['time'] = spatial_temporal_properties.apply(
+                    lambda x: (transaction_date - x['Date']).total_seconds() / 86400, axis=1)
 
-        except ValueError:
-            spatial_temporal_properties = spatial_properties
+                '''KNN selection 选择属性相似的个体'''
+                # Attribute similarity calculation
+                attribute_data = spatial_temporal_properties.iloc[:, 5:].drop(['Price', 'distance', 'time'], axis=1)
+                sub_result = attribute_data.sub(target_property[5:-1])
 
-        '''KNN selection 选择属性相似的个体'''
-        # Attribute similarity calculation
-        initial_selection = spatial_temporal_properties.iloc[:, 3:]
-        sub_result = initial_selection.sub(target_property[3:])
+                # Attribute distance calculation (Euclidean distance or Cosine similarity)
+                attribute_data['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x ** 2)), axis=1)
 
-        # Attribute distance calculation (Euclidean distance or Cosine similarity)
-        initial_selection['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x ** 2)), axis=1)
+                if len(attribute_data) > n_neighbors:
+                    # Select the most similar properties
+                    initial_selection_neighbors = attribute_data.nsmallest(n_neighbors, 'attribute_distance')
+                    initial_selection_neighbors = spatial_temporal_properties.iloc[initial_selection_neighbors.index.tolist(), :]
+                else:
+                    initial_selection_neighbors = spatial_temporal_properties
 
-        if len(initial_selection) > n_neighbors:
-            # Select the most similar properties
-            initial_selection_neighbors = initial_selection.nsmallest(n_neighbors, 'attribute_distance')
-        else:
-            initial_selection_neighbors = initial_selection
+                '''
+                ADJUSTMENT 
+                对于选择得到的个体表现进行预测
+                '''
 
+                '''GTWR Weight Creation 创建GTWR权重函数'''
+                # Gaussian weight function
+                if gtwr_weight == "gaussian":
+                    # Spatial Weight Calculation
+                    initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
+                        lambda x: math.exp(-np.square(x['distance'] / spatial)), axis=1)
 
-        '''
-        ADJUSTMENT 
-        对于选择得到的个体表现进行预测
-        '''
+                    # Temporal Weight Calculation
+                    initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
+                        lambda x: math.exp(-np.square(x['time'] / temporal)), axis=1)
 
-        '''GTWR Weight Creation 创建GTWR权重函数'''
+                    # GTWR Weight Calculation
+                    initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
+                        lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
 
-        # Gaussian weight function
-        if weight_function == "Gaussian":
-            try:
-                # Spatial Weight Calculation
-                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
-                    lambda x: math.exp(-np.square(x['distance'] / spatial)), axis=1)
+                # Bi-Square Weight Function
+                elif gtwr_weight == "bi-square":
 
-                # Temporal Weight Calculation
-                initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
-                    lambda x: math.exp(-np.square(x['time'] / temporal)), axis=1)
+                    # Spatial Weight Calculation
+                    initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
+                        lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial))), axis=1)
 
-                # GTWR Weight Calculation
-                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
-                    lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
+                    # Temporal Weight Calculation
+                    initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
+                        lambda x: np.square(1 - math.exp(np.square(x['time']) / np.square(temporal))), axis=1)
 
-            except Exception:
-                # Spatial Weight Calculation
-                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
-                    lambda x: math.exp(-np.square(x['distance'] / spatial)), axis=1)
+                    # GTWR Weight Calculation
+                    initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
+                        lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
 
-                # GTWR Weight Calculation
-                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
-                    lambda x: x['spatial_weight'], axis=1)
+                # Standardization of the GTWR weights
+                # MinMax Scaler
+                standardized_data = MinMaxScaler().fit_transform(initial_selection_neighbors['GTWR_weight'].values.reshape(-1, 1))
+                initial_selection_neighbors['GTWR_weight_standard'] = standardized_data
 
-        # Bi-Square Weight Function
-        elif weight_function == "Bi-Square":
-            try:
-                # Spatial Weight Calculation
-                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
-                    lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial))), axis=1)
+                ''' 
+                Value aggregation 整合选择得到的个体表现得到预测值
+                '''
+                weight = initial_selection_neighbors.loc[:, 'GTWR_weight_standard'].reset_index(drop=True)
+                price = spatial_temporal_properties.loc[initial_selection_neighbors.index.tolist(), 'Price'].reset_index(drop=True)
+                predicted_price = weight.dot(price)
 
-                # Temporal Weight Calculation
-                initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
-                    lambda x: np.square(1 - math.exp(np.square(x['time']) / np.square(temporal))), axis=1)
+            # 空间包含但是时间不包含
+            else:
+                # Attribute similarity calculation
+                attribute_data = spatial_properties.iloc[:, 5:-1]
+                sub_result = attribute_data.sub(target_property[5:-1])
 
-                # GTWR Weight Calculation
-                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
-                    lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
+                if len(attribute_data) > n_neighbors:
+                    # Select the most similar properties
+                    # Attribute distance calculation (Euclidean distance or Cosine similarity)
+                    attribute_data['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x ** 2)), axis=1)
+                    initial_selection_neighbors = attribute_data.nsmallest(n_neighbors, 'attribute_distance')
 
-            except Exception:
-                # Spatial Weight Calculation
-                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
-                    lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial))), axis=1)
+                else:
+                    initial_selection_neighbors = spatial_properties
 
-                # GTWR Weight Calculation
-                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
-                    lambda x: x['spatial_weight'], axis=1)
+                price = initial_selection_neighbors.loc[initial_selection_neighbors.index.tolist(), 'Price'].reset_index(drop=True)
 
-        # Standardization of the GTWR weights
-        # MinMax Scaler
-        standardized_data = MinMaxScaler().fit_transform(initial_selection_neighbors['GTWR_weight'].values.reshape(-1, 1))
-        initial_selection_neighbors['GTWR_weight_standard'] = standardized_data
+                # KNN hyperparameter configuration
+                # ‘uniform’ : uniform weights. All points in each neighborhood are weighted equally.
+                if knn_weight == 'uniform':
+                    predicted_price = price.mean()
 
-        ''' 
-        Value aggregation 整合选择得到的个体表现得到预测值
-        '''
-        weight = initial_selection_neighbors.loc[:, 'GTWR_weight_standard'].reset_index(drop=True)
-        price = initial_selection_neighbors.loc[:, 'Price'].reset_index(drop=True)
-        predicted_price = weight.dot(price)
+                # ‘distance’ : weight points by the inverse of their distance.
+                # In this case, closer neighbors of a query point will have a greater
+                # influence than neighbors which are further away.
+                elif knn_weight == 'distance':
+                    weights = attribute_data['attribute_distance'].apply(lambda x: 1 / x).reset_index(drop=True)
+                    standardized_weights = weights.apply(lambda x: x / weights.sum()).reset_index(drop=True)
+                    predicted_price = standardized_weights.dot(price)
 
     # 如果地理范围内不存在数据，采用属性KNN计算
     else:
-        # Attribute similarity calculation
-        initial_selection = other_properties.iloc[:, 3:]
-        sub_result = initial_selection.sub(target_property[3:])
+        # increase spatial search range and return sufficient samples for attribute similarity check
+        delta_distance = 100
+
+        i = 0
+        while i < 100:
+            initial_selection = other_properties[(other_properties['x'] <= target_property['x'] + spatial + i * delta_distance) &
+                                                    (other_properties['x'] >= target_property['x'] - spatial - i * delta_distance) &
+                                                    (other_properties['y'] <= target_property['y'] + spatial + i * delta_distance) &
+                                                    (other_properties['y'] >= target_property['y'] - spatial - i * delta_distance)]
+            i += 1
+            if len(initial_selection) < n_neighbors * 2:
+                continue
+            else:
+                break
 
         # Attribute distance calculation (Euclidean distance or Cosine similarity)
-        initial_selection['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x ** 2)), axis=1)
-        initial_selection_neighbors = initial_selection.nsmallest(n_neighbors, 'attribute_distance')
-        price = initial_selection_neighbors.loc[:, 'Price'].reset_index(drop=True)
-        predicted_price = price.mean()
+        attribute_data = initial_selection.iloc[:, 5:-1]
+        sub_result = attribute_data.sub(target_property[5:-1])
+
+        attribute_data['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x ** 2)), axis=1)
+        initial_selection_neighbors = attribute_data.nsmallest(n_neighbors, 'attribute_distance')
+        price = train.loc[initial_selection_neighbors.index.tolist(), 'Price'].reset_index(drop=True)
+
+        # KNN hyperparameter configuration
+        # ‘uniform’ : uniform weights. All points in each neighborhood are weighted equally.
+        if knn_weight == 'uniform':
+            predicted_price = price.mean()
+
+        # ‘distance’ : weight points by the inverse of their distance.
+        # Closer neighbors of a query point will have a greater influence than neighbors which are further away.
+        elif knn_weight == 'distance':
+            weights = initial_selection_neighbors['attribute_distance'].apply(lambda x: 1 / x).reset_index(drop=True)
+            standardized_weights = weights.apply(lambda x: x / weights.sum()).reset_index(drop=True)
+            predicted_price = standardized_weights.dot(price)
 
     return predicted_price
 
 
-# Using test data to predict
-def test_gtwr_knn(train, test, num, spatial, temporal, weight_function, n_neighbors):
+# Derive predictions of the test data set
+def gtwr_knn_prediction(train, test, num, spatial, temporal, gtwr_weight, n_neighbors, knn_weight):
     test = test.reset_index(drop=True)
 
     train['Date'] = pd.to_datetime(train['Date'], format='%d/%m/%Y')
@@ -609,234 +556,262 @@ def test_gtwr_knn(train, test, num, spatial, temporal, weight_function, n_neighb
                                             (other_properties['y'] <= target_property['y'] + spatial) &
                                             (other_properties['y'] >= target_property['y'] - spatial)]
 
-    rectangle_properties['distance'] = rectangle_properties.apply(lambda x: geodesic((
-        target_property['Latitude'],
-        target_property['Longitude']),
-        (x['Latitude'],
-         x['Longitude'])).m,
-        axis=1)
+    if len(rectangle_properties) > 0:
+        rectangle_properties['distance'] = rectangle_properties.apply(lambda x: geodesic((
+            target_property['Latitude'],
+            target_property['Longitude']),
+            (x['Latitude'],
+             x['Longitude'])).m,
+            axis=1)
 
-    spatial_properties = rectangle_properties[rectangle_properties['distance'] <= spatial]
+        # Select properties within the distance threshold
+        spatial_properties = rectangle_properties[rectangle_properties['distance'] <= spatial]
 
-    # 如果地理范围内存在数据
-    if len(spatial_properties) > 0:
+        if len(spatial_properties) > 0:
 
-        # Temporal gap: needs to be larger to cover more data
-        delta = timedelta(days=temporal)
+            # Temporal gap: needs to be larger to cover more data
+            delta = timedelta(days=temporal)
 
-        transaction_date = target_property['Date']
-        start_time = transaction_date - delta
+            transaction_date = target_property['Date']
+            start_time = transaction_date - delta
 
-        # Select the properties within the selected time period
-        try:
+            # Select the properties within the selected time period
+            # If there is no record with specific period, then choose the data with spatial threshold
+
             spatial_temporal_properties = spatial_properties[(spatial_properties['Date'] >= start_time) &
                                                              (spatial_properties['Date'] <= transaction_date)
                                                              ].reset_index(drop=True)
 
-            spatial_temporal_properties['time'] = spatial_temporal_properties.apply(
-                lambda x: (transaction_date - x['Date']).total_seconds() / 86400, axis=1)
+            # Data exists within a pre-determined temporal threshold
+            if len(spatial_temporal_properties) > 0:
+                spatial_temporal_properties['time'] = spatial_temporal_properties.apply(
+                    lambda x: (transaction_date - x['Date']).total_seconds() / 86400, axis=1)
 
-        except ValueError:
-            spatial_temporal_properties = spatial_properties
+                '''KNN selection 选择属性相似的个体'''
+                # Attribute similarity calculation
+                attribute_data = spatial_temporal_properties.iloc[:, 5:].drop(['Price', 'distance', 'time'], axis=1)
+                sub_result = attribute_data.sub(target_property[5:-1])
 
-        '''KNN selection 选择属性相似的个体'''
-        # Attribute similarity calculation
-        initial_selection = spatial_temporal_properties.iloc[:, 3:]
-        sub_result = initial_selection.sub(target_property[3:])
+                # Attribute distance calculation (Euclidean distance or Cosine similarity)
+                attribute_data['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x ** 2)), axis=1)
 
-        # Attribute distance calculation (Euclidean distance or Cosine similarity)
-        initial_selection['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x ** 2)), axis=1)
+                if len(attribute_data) > n_neighbors:
+                    # Select the most similar properties
+                    initial_selection_neighbors = attribute_data.nsmallest(n_neighbors, 'attribute_distance')
+                    initial_selection_neighbors = spatial_temporal_properties.iloc[
+                                                  initial_selection_neighbors.index.tolist(), :]
+                else:
+                    initial_selection_neighbors = spatial_temporal_properties
 
-        if len(initial_selection) > n_neighbors:
-            # Select the most similar properties
-            initial_selection_neighbors = initial_selection.nsmallest(n_neighbors, 'attribute_distance')
-        else:
-            initial_selection_neighbors = initial_selection
+                '''
+                ADJUSTMENT 
+                对于选择得到的个体表现进行预测
+                '''
 
+                '''GTWR Weight Creation 创建GTWR权重函数'''
+                # Gaussian weight function
+                if gtwr_weight == "gaussian":
+                    # Spatial Weight Calculation
+                    initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
+                        lambda x: math.exp(-np.square(x['distance'] / spatial)), axis=1)
 
-        '''
-        ADJUSTMENT 
-        对于选择得到的个体表现进行预测
-        '''
+                    # Temporal Weight Calculation
+                    initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
+                        lambda x: math.exp(-np.square(x['time'] / temporal)), axis=1)
 
-        '''GTWR Weight Creation 创建GTWR权重函数'''
+                    # GTWR Weight Calculation
+                    initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
+                        lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
 
-        # Gaussian weight function
-        if weight_function == "Gaussian":
-            try:
-                # Spatial Weight Calculation
-                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
-                    lambda x: math.exp(-np.square(x['distance'] / spatial)), axis=1)
+                # Bi-Square Weight Function
+                elif gtwr_weight == "bi-square":
 
-                # Temporal Weight Calculation
-                initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
-                    lambda x: math.exp(-np.square(x['time'] / temporal)), axis=1)
+                    # Spatial Weight Calculation
+                    initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
+                        lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial))), axis=1)
 
-                # GTWR Weight Calculation
-                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
-                    lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
+                    # Temporal Weight Calculation
+                    initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
+                        lambda x: np.square(1 - math.exp(np.square(x['time']) / np.square(temporal))), axis=1)
 
-            except Exception:
-                # Spatial Weight Calculation
-                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
-                    lambda x: math.exp(-np.square(x['distance'] / spatial)), axis=1)
+                    # GTWR Weight Calculation
+                    initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
+                        lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
 
-                # GTWR Weight Calculation
-                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
-                    lambda x: x['spatial_weight'], axis=1)
+                # Standardization of the GTWR weights
+                # MinMax Scaler
+                standardized_data = MinMaxScaler().fit_transform(
+                    initial_selection_neighbors['GTWR_weight'].values.reshape(-1, 1))
+                initial_selection_neighbors['GTWR_weight_standard'] = standardized_data
 
-        # Bi-Square Weight Function
-        elif weight_function == "Bi-Square":
-            try:
-                # Spatial Weight Calculation
-                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
-                    lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial))), axis=1)
+                ''' 
+                Value aggregation 整合选择得到的个体表现得到预测值
+                '''
+                weight = initial_selection_neighbors.loc[:, 'GTWR_weight_standard'].reset_index(drop=True)
+                price = spatial_temporal_properties.loc[
+                    initial_selection_neighbors.index.tolist(), 'Price'].reset_index(drop=True)
+                predicted_price = weight.dot(price)
 
-                # Temporal Weight Calculation
-                initial_selection_neighbors['temporal_weight'] = initial_selection_neighbors.apply(
-                    lambda x: np.square(1 - math.exp(np.square(x['time']) / np.square(temporal))), axis=1)
+            # 空间包含但是时间不包含
+            else:
+                # Attribute similarity calculation
+                attribute_data = spatial_properties.iloc[:, 5:-1]
+                sub_result = attribute_data.sub(target_property[5:-1])
 
-                # GTWR Weight Calculation
-                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
-                    lambda x: x['spatial_weight'] * x['temporal_weight'], axis=1)
+                if len(attribute_data) > n_neighbors:
+                    # Select the most similar properties
+                    # Attribute distance calculation (Euclidean distance or Cosine similarity)
+                    attribute_data['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x ** 2)), axis=1)
+                    initial_selection_neighbors = attribute_data.nsmallest(n_neighbors, 'attribute_distance')
 
-            except Exception:
-                # Spatial Weight Calculation
-                initial_selection_neighbors['spatial_weight'] = initial_selection_neighbors.apply(
-                    lambda x: np.square(1 - math.exp(np.square(x['distance']) / np.square(spatial))), axis=1)
+                else:
+                    initial_selection_neighbors = spatial_properties
 
-                # GTWR Weight Calculation
-                initial_selection_neighbors['GTWR_weight'] = initial_selection_neighbors.apply(
-                    lambda x: x['spatial_weight'], axis=1)
+                price = initial_selection_neighbors.loc[
+                    initial_selection_neighbors.index.tolist(), 'Price'].reset_index(drop=True)
 
-        # Standardization of the GTWR weights
-        # MinMax Scaler
-        standardized_data = MinMaxScaler().fit_transform(
-            initial_selection_neighbors['GTWR_weight'].values.reshape(-1, 1))
+                # KNN hyperparameter configuration
+                # ‘uniform’ : uniform weights. All points in each neighborhood are weighted equally.
+                if knn_weight == 'uniform':
+                    predicted_price = price.mean()
 
-        initial_selection_neighbors['GTWR_weight_standard'] = standardized_data
-
-        ''' 
-        Value aggregation 整合选择得到的个体表现得到预测值
-        '''
-        weight = initial_selection_neighbors.loc[:, 'GTWR_weight_standard'].reset_index(drop=True)
-        price = initial_selection_neighbors.loc[:, 'Price'].reset_index(drop=True)
-        predicted_price = weight.dot(price)
+                # ‘distance’ : weight points by the inverse of their distance.
+                # In this case, closer neighbors of a query point will have a greater
+                # influence than neighbors which are further away.
+                elif knn_weight == 'distance':
+                    weights = attribute_data['attribute_distance'].apply(lambda x: 1 / x).reset_index(drop=True)
+                    standardized_weights = weights.apply(lambda x: x / weights.sum()).reset_index(drop=True)
+                    predicted_price = standardized_weights.dot(price)
 
     # 如果地理范围内不存在数据，采用属性KNN计算
     else:
-        # Attribute similarity calculation
-        initial_selection = other_properties.iloc[:, 3:]
-        sub_result = initial_selection.sub(target_property[3:])
+        # increase spatial search range and return sufficient samples for attribute similarity check
+        delta_distance = 100
+
+        i = 0
+        while i < 100:
+            initial_selection = other_properties[
+                (other_properties['x'] <= target_property['x'] + spatial + i * delta_distance) &
+                (other_properties['x'] >= target_property['x'] - spatial - i * delta_distance) &
+                (other_properties['y'] <= target_property['y'] + spatial + i * delta_distance) &
+                (other_properties['y'] >= target_property['y'] - spatial - i * delta_distance)]
+            i += 1
+            if len(initial_selection) < n_neighbors * 2:
+                continue
+            else:
+                break
 
         # Attribute distance calculation (Euclidean distance or Cosine similarity)
-        initial_selection['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x ** 2)), axis=1)
-        initial_selection_neighbors = initial_selection.nsmallest(n_neighbors, 'attribute_distance')
-        price = initial_selection_neighbors.loc[:, 'Price'].reset_index(drop=True)
-        predicted_price = price.mean()
+        attribute_data = initial_selection.iloc[:, 5:-1]
+        sub_result = attribute_data.sub(target_property[5:-1])
+
+        attribute_data['attribute_distance'] = sub_result.apply(lambda x: np.sqrt(np.sum(x ** 2)), axis=1)
+        initial_selection_neighbors = attribute_data.nsmallest(n_neighbors, 'attribute_distance')
+        price = train.loc[initial_selection_neighbors.index.tolist(), 'Price'].reset_index(drop=True)
+
+        # KNN hyperparameter configuration
+        # ‘uniform’ : uniform weights. All points in each neighborhood are weighted equally.
+        if knn_weight == 'uniform':
+            predicted_price = price.mean()
+
+        # ‘distance’ : weight points by the inverse of their distance.
+        # Closer neighbors of a query point will have a greater influence than neighbors which are further away.
+        elif knn_weight == 'distance':
+            weights = initial_selection_neighbors['attribute_distance'].apply(lambda x: 1 / x).reset_index(drop=True)
+            standardized_weights = weights.apply(lambda x: x / weights.sum()).reset_index(drop=True)
+            predicted_price = standardized_weights.dot(price)
 
     return predicted_price
 
 
-# Model training and testing
-def main():
-    pred_train1 = pd.read_csv('spatial_500_temporal_30_n_5_prediction_results.csv', encoding='unicode_escape',
-                              header=None)
+def parallel_training(train_data, spatial, temporal, gtwr_weight, n_neighbors, knn_weight, n_jobs):
+    cpu_num = range(1, multiprocessing.cpu_count() + 1)
+    processor_num = cpu_num[n_jobs - 1] if n_jobs > 0 else cpu_num[n_jobs]
 
-    pred_train2 = pd.read_csv('spatial_500_temporal_30_n_10_prediction_results.csv', encoding='unicode_escape',
-                              header=None)
+    training_result = []
+    # Grid search
+    for i in spatial:
+        for j in temporal:
+            for k in n_neighbors:
+                '''
+                Parallel Computing 并行计算进行训练
+                '''
+                data_count = len(train_data)
+                pbar = tqdm(total=data_count,
+                            file=sys.stdout,
+                            desc='GTWR_KNN_Training',
+                            colour='white')
 
-    pred_train3 = pd.read_csv('spatial_500_temporal_30_n_15_prediction_results.csv', encoding='unicode_escape',
-                              header=None)
+                update = lambda *args: pbar.update()
 
-    pred_train4 = pd.read_csv('spatial_500_temporal_45_n_5_prediction_results.csv', encoding='unicode_escape',
-                              header=None)
+                # VERY IMPORTANT: check how many cores in your PC
+                pool = multiprocessing.Pool(processes=processor_num)
 
-    print(model_performance(train_data.iloc[:, -1], pred_train1))
-    print(model_performance(train_data.iloc[:, -1], pred_train2))
-    print(model_performance(train_data.iloc[:, -1], pred_train3))
-    print(model_performance(train_data.iloc[:, -1], pred_train4))
+                # 定义一个列表来存储每次循环的结果
+                results = []
+
+                # 并行运行for循环
+                for num in range(data_count):
+                    # 将任务提交给进程池
+                    result = pool.apply_async(gtwr_knn_training,
+                                              args=(train_data,
+                                                    num,
+                                                    i,
+                                                    j,
+                                                    gtwr_weight,
+                                                    k,
+                                                    knn_weight),
+                                              callback=update)
+                    results.append(result)
+
+                # 等待所有进程完成
+                pool.close()
+                pool.join()
+                # print('Time: {} seconds'.format(time.time()-start))
+
+                pred_results = []
+                # 打印每次循环的结果
+                for result in results:
+                        pred_results.append(result.get())
+
+                pred_results = pd.DataFrame(pred_results)
+
+                pred_results.to_csv('./training_results/spatial_{}_temporal_{}_n_{}_prediction_results.csv'.
+                                    format(i,
+                                           j,
+                                           k),
+                                    index=False,
+                                    header=False)
+
+                performance_result = model_performance(train_data.iloc[:, -1], pred_results)
+                performance_result['spatial_bandwidth'] = i
+                performance_result['temporal_bandwidth'] = j
+                performance_result['n_neighbors'] = k
+
+                training_result.append(performance_result)
+
+    best_parameters = min(training_result, key=lambda x: x['MAE'])
+    print('Best Parameters: ', best_parameters)
+    return best_parameters
+
+'''
+Parallel Computing 并行计算进行结果预测
+'''
 
 
-if __name__ == "__main__":
-    # GTWR-based algorithm design
-    walk_threshold = 400
+def parallel_testing(train_data, test_data, spatial, temporal, gtwr_weight, n_neighbors, knn_weight, n_jobs):
 
-    # candidate for grid search (500, 750, 1000, 1500, 2000)
-    spatial_bandwidth_candidates = [500, 750, 1000, 1500, 2000]
+    cpu_num = range(1, multiprocessing.cpu_count() + 1)
+    processor_num = cpu_num[n_jobs - 1] if n_jobs > 0 else cpu_num[n_jobs]
 
-    # candidate for grid search (30, 45, 60, 75, 90)
-    temporal_bandwidth_candidates = [30, 45, 60, 75, 90]
-
-    # candidate for grid search (5, 10, 15)
-    n_neighbors = [5, 10, 15]
-
-    data = pd.read_csv('data_variables.csv', encoding='unicode_escape')
-    train_data = data_split(data, walk_threshold)[0]
-    test_data = data_split(data, walk_threshold)[1]
-
-    # knn_benchmark(data, walk_threshold)
-
-    # Grid search 循环
-    # for i in spatial_bandwidth_candidates:
-    #     for j in temporal_bandwidth_candidates:
-    #         for k in n_neighbors:
-    #             '''
-    #             Parallel Computing 并行计算进行训练
-    #             '''
-    #             data_count = len(train_data)
-    #             pbar = tqdm(total=data_count)
-    #             pbar.set_description('GTWR_KNN')
-    #             update = lambda *args: pbar.update()
-    #
-    #             # VERY IMPORTANT: check how many cores in your PC
-    #             pool = multiprocessing.Pool(processes=4)
-    #
-    #             # 定义一个列表来存储每次循环的结果
-    #             results = []
-    #
-    #             # 并行运行for循环
-    #             for num in range(data_count):
-    #                 # 将任务提交给进程池
-    #                 result = pool.apply_async(gtwr_knn,
-    #                                           args=(train_data,
-    #                                                 num,
-    #                                                 i,
-    #                                                 j,
-    #                                                 'Bi-Square',
-    #                                                 k),
-    #                                           callback=update)
-    #                 results.append(result)
-    #
-    #             # 等待所有进程完成
-    #             pool.close()
-    #             pool.join()
-    #             # print('Time: {} seconds'.format(time.time()-start))
-    #
-    #             pred_results = []
-    #             # 打印每次循环的结果
-    #             for result in results:
-    #                 pred_results.append(result.get())
-    #
-    #             pred_results = pd.DataFrame(pred_results)
-    #
-    #             pred_results.to_csv('spatial_{}_temporal_{}_n_{}_prediction_results.csv'.
-    #                                 format(i,
-    #                                        j,
-    #                                        k),
-    #                                 index=False,
-    #                                 header=False)
-
-    '''
-    Parallel Computing 并行计算进行结果预测
-    '''
+    # Testing
     data_count = len(test_data)
     pbar = tqdm(total=data_count)
     pbar.set_description('GTWR_KNN_Testing')
     update = lambda *args: pbar.update()
 
     # VERY IMPORTANT: check how many cores in your PC
-    pool = multiprocessing.Pool(processes=8)
+    pool = multiprocessing.Pool(processes=processor_num)
 
     # 定义一个列表来存储每次循环的结果
     results = []
@@ -844,14 +819,15 @@ if __name__ == "__main__":
     # 并行运行for循环
     for num in range(data_count):
         # 将任务提交给进程池
-        result = pool.apply_async(test_gtwr_knn,
+        result = pool.apply_async(gtwr_knn_prediction,
                                   args=(train_data,
                                         test_data,
                                         num,
-                                        500,
-                                        45,
-                                        'Bi-Square',
-                                        5),
+                                        spatial,
+                                        temporal,
+                                        gtwr_weight,
+                                        n_neighbors,
+                                        knn_weight),
                                   callback=update)
         results.append(result)
 
@@ -865,4 +841,46 @@ if __name__ == "__main__":
         pred_results.append(result.get())
 
     pred_results = pd.DataFrame(pred_results)
-    print(model_performance(test_data.iloc[:, -1], pd.DataFrame(pred_results)))
+    testing_results = model_performance(test_data.iloc[:, -1], pred_results)
+    print(testing_results)
+
+    return testing_results
+
+
+if __name__ == "__main__":
+    walk_threshold = 400
+    data_features = pd.read_csv('data_features.csv', encoding='unicode_escape')
+    train_data = data_split(data=data_features, threshold=walk_threshold)[0]
+    test_data = data_split(data=data_features, threshold=walk_threshold)[1]
+
+    # candidate for grid search (500, 1000, 1500, 2000)
+    spatial_bandwidth_candidates = [500, 1000, 1500, 2000]
+
+    # candidate for grid search (30, 45, 60, 75, 90)
+    temporal_bandwidth_candidates = [30, 45, 60, 75, 90]
+
+    # candidate for grid search (5, 10, 15)
+    n_neighbors = [5, 7, 9, 11, 13, 15]
+
+    # get the best parameters from grid search strategy
+    best_parameters = parallel_training(
+                      train_data=train_data,
+                      spatial=spatial_bandwidth_candidates,
+                      temporal=temporal_bandwidth_candidates,
+                      gtwr_weight='bi-square',
+                      n_neighbors=n_neighbors,
+                      knn_weight='uniform',
+                      n_jobs=-1)
+
+    # Derive predictions on testing set
+    predictions = parallel_testing(train_data=train_data,
+                                   test_data=test_data,
+                                   spatial=best_parameters['spatial_bandwidth'],
+                                   temporal=best_parameters['temporal_bandwidth'],
+                                   gtwr_weight='bi-square',
+                                   n_neighbors=best_parameters['n_neighbors'],
+                                   knn_weight='uniform',
+                                   n_jobs=-1)
+
+
+
